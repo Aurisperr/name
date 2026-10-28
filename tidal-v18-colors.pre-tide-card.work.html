@@ -338,10 +338,14 @@ var DEAD=false,CTX_LOST=false;
    line below - and the guard that was written to say "the sea god cannot be
    reached on this machine" sat further down and never got the chance. */
 var gl=null,DERIV_EXT=null;
+var PARALLEL_SHADER_EXT=null;
 try{
   gl=glc.getContext('webgl',{antialias:false,alpha:false,depth:false,stencil:false,
     preserveDrawingBuffer:false,powerPreference:'high-performance'});
-  if(gl) DERIV_EXT=gl.getExtension('OES_standard_derivatives');
+  if(gl){
+    DERIV_EXT=gl.getExtension('OES_standard_derivatives');
+    PARALLEL_SHADER_EXT=gl.getExtension('KHR_parallel_shader_compile');
+  }
 }catch(e){ gl=null; }
 if(!gl) fatal('this browser has not given the piece a webgl context');
 
@@ -373,9 +377,10 @@ glc.addEventListener('webglcontextrestored',function(){
      framebuffer when it has none to keep, so this one has to be emptied by
      hand or the scene is drawn into a framebuffer that is not there. */
   sceneFbo=null;
-  initGL();
-  layout();            /* this hands the words on the sand back to the GPU */
-  prevT=performance.now();
+  initGL().then(function(){
+    layout();          /* this hands the words on the sand back to the GPU */
+    prevT=performance.now();
+  }).catch(fatal);
 },false);
 /* Nothing ever reads the GL canvas back, so the drawing buffer does not
    need to be preserved : keeping it costs a full-canvas copy every
@@ -2181,12 +2186,34 @@ function compile(type,src){
   if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)+"\n"+src);
   return s;
 }
-function program(vs,fs){
+function programSync(vs,fs){
   var p=gl.createProgram();
   gl.attachShader(p,compile(gl.VERTEX_SHADER,vs));
   gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs));
   gl.bindAttribLocation(p,0,'aPos');
   gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+/* Compile every program without waiting for one driver at a time.  The
+   shader source and render resolution are unchanged; only the scheduling
+   changes.  Browsers without the extension keep the original safe path. */
+async function program(vs,fs){
+  if(!PARALLEL_SHADER_EXT) return programSync(vs,fs);
+  var p=gl.createProgram();
+  var v=gl.createShader(gl.VERTEX_SHADER);
+  var f=gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(v,vs); gl.compileShader(v);
+  gl.shaderSource(f,fs); gl.compileShader(f);
+  gl.attachShader(p,v);
+  gl.attachShader(p,f);
+  gl.bindAttribLocation(p,0,'aPos');
+  gl.linkProgram(p);
+  while(!gl.getProgramParameter(p,PARALLEL_SHADER_EXT.COMPLETION_STATUS_KHR)){
+    await new Promise(function(resolve){ setTimeout(resolve,8); });
+  }
+  if(!gl.getShaderParameter(v,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(v)+"\n"+vs);
+  if(!gl.getShaderParameter(f,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(f)+"\n"+fs);
   if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
   return p;
 }
@@ -2457,13 +2484,21 @@ function uploadInk(){
 }
 var IBOX={x:0,y:0,w:0,h:0},SS=1;
 
-function initGL(){
-  progScene=program(VS_SRC,SCENE_SRC);
-  progEro=program(VS_SRC,ERO_SRC);
-  progPost=program(VS_SRC,POST_SRC);
-  progBright=program(VS_SRC,BRIGHT_SRC);
-  progBlur=program(VS_SRC,BLUR_SRC);
-  progBuild=program(BUILD_VS_SRC,BUILD_FS_SRC);
+async function initGL(){
+  var jobs=await Promise.all([
+    program(VS_SRC,SCENE_SRC),
+    program(VS_SRC,ERO_SRC),
+    program(VS_SRC,POST_SRC),
+    program(VS_SRC,BRIGHT_SRC),
+    program(VS_SRC,BLUR_SRC),
+    program(BUILD_VS_SRC,BUILD_FS_SRC)
+  ]);
+  progScene=jobs[0];
+  progEro=jobs[1];
+  progPost=jobs[2];
+  progBright=jobs[3];
+  progBlur=jobs[4];
+  progBuild=jobs[5];
   U=uniforms(progScene,['uRes','uTime','uTide','uWave','uCharge','uFlash','uWet',
     'uShore','uMax','uHorizon','uSun','uSunR','uBox','uInk','uInkBlur','uEro','uMouse','uMouseOn','uMark',
     'uDawn','uLit','uSunUp','uWaveXScale']);
@@ -2950,7 +2985,7 @@ var WORD_DECOYS=['rafael','rafyel','rayafel','rafalel','rafavel','rafayle',
 var WORD_CUTS=['raf','rafa','rafay','rafaye',
                'Raf','Rafa','Rafay','Rafaye',
                'RAF','RAFA','RAFAY','RAFAYE'];
-var WTPL={},WTPLV={};
+var WTPL={},WTPLV={},WORD_TPL_READY=false;
 /* ?dbgmatch prints what the matcher scored, so a threshold can be set from
    evidence instead of from a feeling */
 var DBGMATCH=(typeof location!=='undefined')&&location.search.indexOf('dbgmatch')>=0;
@@ -2981,25 +3016,49 @@ function wordGrid(s,font){
   if(bb.w<3||bb.h<3) return null;
   return gridOfRegion(m,W,H,bb.x,bb.y,bb.w,bb.h);
 }
+function addWordTemplate(s){
+  var vs=[];
+  for(var f=0;f<WORD_FONTS.length;f++){
+    var g=wordGrid(s,WORD_FONTS[f]);
+    if(!g) continue;
+    var face=vs.length;
+    vs.push({g:g,d:distT(g),f:face,b:1});
+    for(var v=0;v<JIT.length;v++){
+      var jg=jitterGrid(g,JIT[v][0],JIT[v][1],JIT[v][2],0,0);
+      vs.push({g:jg,d:distT(jg),f:face,b:0});
+    }
+  }
+  if(!vs.length) return;
+  WTPL[s]=vs[0].g;
+  WTPLV[s]=vs;
+}
 function buildWordTPL(){
   WTPL={}; WTPLV={};
   var all=WORD_T.concat(WORD_DECOYS).concat(WORD_CUTS);
-  for(var i=0;i<all.length;i++){
-    var s=all[i],vs=[];
-    for(var f=0;f<WORD_FONTS.length;f++){
-      var g=wordGrid(s,WORD_FONTS[f]);
-      if(!g) continue;
-      var face=vs.length;
-      vs.push({g:g,d:distT(g),f:face,b:1});
-      for(var v=0;v<JIT.length;v++){
-        var jg=jitterGrid(g,JIT[v][0],JIT[v][1],JIT[v][2],0,0);
-        vs.push({g:jg,d:distT(jg),f:face,b:0});
-      }
+  for(var i=0;i<all.length;i++) addWordTemplate(all[i]);
+  WORD_TPL_READY=true;
+}
+/* The same tables, built a few words at a time after the opening frame.
+   Recognition stays disabled until the last word is present, so it can
+   never score against a partially populated dictionary. */
+function buildWordTPLChunked(done){
+  WTPL={}; WTPLV={}; WORD_TPL_READY=false;
+  var all=WORD_T.concat(WORD_DECOYS).concat(WORD_CUTS),i=0;
+  function step(){
+    if(DEAD) return;
+    var started=performance.now();
+    do{
+      addWordTemplate(all[i++]);
+    }while(i<all.length&&performance.now()-started<8);
+    if(i<all.length){
+      if(window.requestIdleCallback) requestIdleCallback(step,{timeout:50});
+      else setTimeout(step,0);
+      return;
     }
-    if(!vs.length) continue;
-    WTPL[s]=vs[0].g;
-    WTPLV[s]=vs;
+    WORD_TPL_READY=true;
+    done();
   }
+  step();
 }
 function maskToGrid(mask,w,h,bx0,by0,bw,bh){
   var g=new Float32Array(RG*RG);
@@ -3444,7 +3503,7 @@ function matchWord(grid){
   return out;
 }
 function recognizeWord(m,w,h){
-  if(!WTPLV[WORD_T[0]]) return {ok:false,s:0,why:'TEMPLATE NOT READY'};
+  if(!WORD_TPL_READY||!WTPLV[WORD_T[0]]) return {ok:false,s:0,why:'TEMPLATE NOT READY'};
   var bb=bboxOf(m,w,h,0.22);
   if(bb.w<10||bb.h<5) return {ok:false,s:0,why:'TOO LITTLE IN THE SAND'};
   /* A word is wider than it is tall, but a word is not a line.  Both are
@@ -4106,12 +4165,26 @@ document.addEventListener('visibilitychange',function(){
   PERF_FRAMES=0; PERF_MS=0; PERF_WIN=0; PERF_WARMUP=0; PERF_HOLD=0;
 });
 
-function boot(){
+var templatesScheduled=false;
+function scheduleTemplates(){
+  if(templatesScheduled) return;
+  templatesScheduled=true;
+  /* Let the first rendered frame reach the screen before building the
+     recognition tables.  They use the same grids and scores as before, but
+     no longer hold the opening frame behind half a second of canvas work. */
+  requestAnimationFrame(function(){
+    setTimeout(function(){
+      if(DEAD) return;
+      try{
+        buildWordTPLChunked(buildTPL);
+      }catch(err){ fatal(err); }
+    },0);
+  });
+}
+async function boot(){
   if(DEAD) return;
-  initGL();
+  await initGL();
   layout();
-  buildTPL();
-  buildWordTPL();
   var qq=new URLSearchParams(location.search);
   HOLD=qq.has('notide');
   QDEBUG=qq.has('q')||qq.has('quality');
@@ -4132,7 +4205,15 @@ function boot(){
        looked like the old ritual had been forgotten. */
     PENDING_DEMO=1;
   }
-  if(!DBG) requestAnimationFrame(frame);
+  if(!DBG){
+    requestAnimationFrame(frame);
+    scheduleTemplates();
+  }
+  else{
+    /* Frozen debug frames need the matcher before writeDemo() runs. */
+    buildWordTPL();
+    buildTPL();
+  }
 }
 /* the word the piece asks for, unless the demonstration is asked for
    another one so that the matcher can be measured */
@@ -4222,8 +4303,7 @@ function fatal(reason){
       +String(window.__err).replace(/[<>]/g,'').slice(0,420)+'</div></div>';
   }
 }
-try{ boot(); }
-catch(err){ fatal(err); }
+boot().catch(fatal);
 </script>
 </body>
 </html>
